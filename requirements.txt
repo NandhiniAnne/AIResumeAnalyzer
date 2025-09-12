@@ -1,0 +1,8 @@
+gradio
+sentence-transformers
+PyMuPDF
+numpy
+transformers
+torch
+python-dotenv
+qdrant-client
