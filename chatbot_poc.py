@@ -1,29 +1,10 @@
-#!/usr/bin/env python3
-"""
-AI Resume Analyzer — Section-based single-file script.
-
-Features:
-- Section-based parsing and canonicalization
-- Stores sections in Qdrant payload for precise filtering
-- Candidate-level aggregation & candidate_id
-- Query mapping to sections (e.g., "what certifications", "list skills")
-- Candidate name extraction from queries
-- Prioritized search: section intent -> candidate name -> location/skill -> semantic fallback
-
-Requirements:
-- spacy (and en_core_web_trf)
-- sentence-transformers
-- PyMuPDF (fitz)
-- python-docx
-- qdrant-client
-- langchain (for RecursiveCharacterTextSplitter)
-"""
-
+import numpy as _np
 import os
 import re
 import uuid
 from collections import defaultdict
 from difflib import get_close_matches
+from typing import List, Dict, Tuple
 
 import fitz  # PyMuPDF
 import docx  # python-docx
@@ -58,9 +39,6 @@ nlp = spacy.load(SPACY_MODEL)
 embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 print("Ready.")
-
-# ------------------ Section splitting & small extractors ------------------
-
 # Heading mapping and heuristics
 HEADING_MAP = {
     "SUMMARY": "summary", "PROFILE": "summary", "OBJECTIVE": "summary",
@@ -89,6 +67,17 @@ SECTION_SYNONYMS = {
 }
 # reverse index
 SECTION_KEYWORDS = {kw: sec for sec, kws in SECTION_SYNONYMS.items() for kw in kws}
+def clamp01(x: float) -> float:
+    """Clamp a number to the [0,1] range."""
+    try:
+        return max(0.0, min(1.0, float(x)))
+    except Exception:
+        return 0.0
+def normalize_token(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r'[\W_]+', ' ', s)  # keep letters/digits, convert punctuation -> space
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
 
 def canonicalize_heading(h):
     h_up = h.upper().strip()
@@ -450,8 +439,12 @@ def ingest_resumes():
     print(f"Ingested {len(points)} chunks from {len(files)} files.")
 
 # ------------------ aggregation & helpers ------------------
-
 def aggregate_hits(points):
+    """
+    Group point-level payloads into candidate-level records.
+
+    Returns a dict: candidate_id -> aggregated info dict
+    """
     grouped = defaultdict(lambda: {
         "filenames": set(),
         "candidate_name": None,
@@ -462,6 +455,7 @@ def aggregate_hits(points):
         "locations": set(),
         "education": set(),
         "certifications": set(),
+        "experience": [],       # <-- ensure experience list exists and is merged
         "sections": {},
         "contexts": []
     })
@@ -469,6 +463,7 @@ def aggregate_hits(points):
         payload = p.payload if hasattr(p, "payload") else p.get("payload", {})
         cid = (payload.get("candidate_id") or payload.get("email") or payload.get("candidate_name") or payload.get("filename") or str(uuid.uuid4())).lower()
         g = grouped[cid]
+
         if payload.get("candidate_name"):
             g["candidate_name"] = payload.get("candidate_name")
         if payload.get("email"):
@@ -477,6 +472,7 @@ def aggregate_hits(points):
             g["phones"].add(payload.get("phone"))
         if payload.get("linkedin"):
             g["linkedin"].add(payload.get("linkedin"))
+
         for s in (payload.get("skills") or []):
             if s:
                 g["skills"].add(s.lower())
@@ -489,6 +485,14 @@ def aggregate_hits(points):
         for c in (payload.get("certifications") or []):
             if c:
                 g["certifications"].add(c)
+
+        # merge experience entries if present in payload
+        for job in (payload.get("experience") or []):
+            if job:
+                # avoid duplicates (simple object equality)
+                if job not in g["experience"]:
+                    g["experience"].append(job)
+
         # merge sections dicts (keep section text; prefer existing if present)
         sec = payload.get("sections") or {}
         if isinstance(sec, dict):
@@ -496,11 +500,12 @@ def aggregate_hits(points):
                 if k not in g["sections"]:
                     g["sections"][k] = v
                 else:
-                    # append if different
                     if v and v not in g["sections"][k]:
                         g["sections"][k] += "\n\n" + v
+
         if payload.get("filename"):
             g["filenames"].add(payload.get("filename"))
+
         if payload.get("text"):
             g["contexts"].append(payload.get("text"))
     return grouped
@@ -633,9 +638,91 @@ def qdrant_query_by_section(section_key, text_filter=None, limit=500):
             print("Error querying qdrant by section:", e)
             results = []
     return results
+def handle_personal_details_query(query_text: str, grouped: dict) -> bool:
+    """
+    If the query clearly asks for personal/contact details, print contact fields
+    (email, phone, linkedin, locations) for the candidate(s) in `grouped`.
+    If contact fields are missing from grouped payload, scan 'sections' and 'contexts'
+    for email/phone/linkedin using regexes as a fallback.
+    Returns True if the handler printed something (so caller can return/skip ranking).
+    """
+    q = (query_text or "").lower()
+    contact_keywords = (
+        "personal details", "personal detail", "personal info", "contact details",
+        "contact info", "contact information", "personal information",
+        "email", "phone", "mobile", "linkedin", "contact"
+    )
+    if not any(k in q for k in contact_keywords):
+        return False
 
+    if not grouped:
+        print("No candidates found to show contact details for.")
+        return True
+
+    # regexes for fallback scanning
+    email_re = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-z]{2,}', re.I)
+    phone_re = re.compile(r'(\+?\d[\d\s().\-]{7,}\d)', re.I)
+    linkedin_re = re.compile(r'(linkedin\.com/[^\s,;]+)', re.I)
+
+    printed = 0
+    for cid, info in grouped.items():
+        if printed >= 5:
+            break
+        name = info.get("candidate_name") or cid
+
+        # Primary fields from aggregated payload
+        emails = sorted(info.get("emails") or [])
+        phones = sorted(info.get("phones") or [])
+        linkedin = sorted(info.get("linkedin") or [])
+
+        # Fallback: scan sections and contexts if some fields missing
+        if not emails or not phones or not linkedin:
+            sec = info.get("sections") or {}
+            if isinstance(sec, dict):
+                for k, v in sec.items():
+                    if not emails:
+                        emails.extend(email_re.findall(v or ""))
+                    if not phones:
+                        phones.extend(phone_re.findall(v or ""))
+                    if not linkedin:
+                        linkedin.extend(linkedin_re.findall(v or ""))
+            for ctx in info.get("contexts", [])[:10]:
+                if not emails:
+                    emails.extend(email_re.findall(ctx or ""))
+                if not phones:
+                    phones.extend(phone_re.findall(ctx or ""))
+                if not linkedin:
+                    linkedin.extend(linkedin_re.findall(ctx or ""))
+                if emails and phones and linkedin:
+                    break
+
+        # dedupe + cleanup
+        emails = sorted(set(emails))
+        phones = sorted({re.sub(r'\s+', ' ', p).strip() for p in phones})
+        linkedin = sorted(set(linkedin))
+
+        emails_str = ", ".join(emails) if emails else "Not found"
+        phones_str = ", ".join(phones) if phones else "Not found"
+        linkedin_str = ", ".join(linkedin) if linkedin else "Not found"
+        locations = ", ".join(sorted(list(info.get("locations") or []))) if info.get("locations") else "Not found"
+
+        print(f"\nCandidate: {name}")
+        print(f"  Email   : {emails_str}")
+        print(f"  Phone   : {phones_str}")
+        print(f"  LinkedIn: {linkedin_str}")
+        print(f"  Location: {locations}")
+
+        ctxs = info.get("contexts", []) or []
+        if ctxs:
+            snippet = ctxs[0].replace("\n", " ").strip()
+            if len(snippet) > 300:
+                snippet = snippet[:300].rsplit(" ", 1)[0] + "..."
+            print("  Summary :", snippet)
+
+        printed += 1
+
+    return True
 # ------------------ main search flow ------------------
-
 def search_resumes(query_text):
     print(f"\nAnalyzing query: '{query_text}'")
 
@@ -650,25 +737,34 @@ def search_resumes(query_text):
         print("No data found in Qdrant. Run ingestion first.")
         return
 
+    # build quick lookup sets
     all_names = sorted({(p.payload.get("candidate_name") or "").strip().lower() for p in all_pts if p.payload.get("candidate_name")})
     all_locations = set()
     all_skills = set()
     for p in all_pts:
         for loc in (p.payload.get("locations") or []):
-            all_locations.add(loc.lower())
+            try:
+                all_locations.add(loc.lower())
+            except Exception:
+                pass
         for sk in (p.payload.get("skills") or []):
-            all_skills.add(sk.lower())
+            try:
+                all_skills.add(sk.lower())
+            except Exception:
+                pass
 
-    # 0) section-intent detection
+    # 0) section-intent detection (e.g., "what are certifications")
     section_target = map_query_to_section(query_text)
     if section_target:
         print(f"Detected section intent: {section_target}")
         # check if query also contains a name
         candidate_name = extract_name_from_query(query_text, all_names)
         if candidate_name:
-            # filter to that candidate and show only section
             candidate_points = [p for p in all_pts if (p.payload.get("candidate_name") or "").strip().lower() == candidate_name]
             grouped = aggregate_hits(candidate_points)
+            # allow personal details handler for name-scoped section requests
+            if handle_personal_details_query(query_text, grouped):
+                return
             for k, info in grouped.items():
                 print(f"\nCandidate: {info.get('candidate_name')}")
                 sec_text = ""
@@ -683,14 +779,17 @@ def search_resumes(query_text):
                 print("-" * 50)
             return
 
-        # else query across all resumes for that section
+        # else search the section across all resumes (try server-side then semantic fallback)
         section_points = qdrant_query_by_section(section_target)
         if not section_points:
-            # fallback to semantic search then post-filter by section text
+            # semantic fallback and post-filter by section contents
             print("No direct section-tagged points found; performing semantic search + section post-filter.")
-            qvec = embedding_model.encode(query_text).tolist()
-            sem = qdrant_client.search(collection_name=COLLECTION_NAME, query_vector=qvec, limit=40, with_payload=True)
-            sem_norm = normalize_qdrant_points(sem)
+            try:
+                qvec = embedding_model.encode(query_text).tolist()
+                sem = qdrant_client.search(collection_name=COLLECTION_NAME, query_vector=qvec, limit=40, with_payload=True)
+                sem_norm = normalize_qdrant_points(sem)
+            except Exception:
+                sem_norm = []
             filtered = []
             for p in sem_norm:
                 secobj = p.payload.get("sections") or {}
@@ -725,10 +824,11 @@ def search_resumes(query_text):
     query_lower = query_text.lower()
     name_from_query = extract_name_from_query(query_text, all_names)
     if name_from_query:
+        # explicit name -> restrict results to that candidate's points
         results = [p for p in all_pts if (p.payload.get("candidate_name") or "").strip().lower() == name_from_query]
         print(f"Resolved candidate name from query: {name_from_query}")
     else:
-        # try location
+        # try location detection via spaCy GPE or fuzzy match
         q_loc = None
         doc_q = nlp(query_text)
         for ent in doc_q.ents:
@@ -736,32 +836,65 @@ def search_resumes(query_text):
                 q_loc = ent.text.strip().lower()
                 break
         if not q_loc:
-            # fuzzy match against known locations
             for w in re.findall(r'\w+', query_text.lower()):
                 m = get_close_matches(w, list(all_locations), n=1, cutoff=0.85)
                 if m:
                     q_loc = m[0]; break
+
         if q_loc:
             results = [p for p in all_pts if q_loc in [loc.lower() for loc in (p.payload.get("locations") or [])]]
             print(f"Exact location match found: {q_loc}")
         else:
-            # skills exact
+            # exact skill matching
             matched_skills = [s for s in all_skills if s in query_lower]
             if matched_skills:
                 results = [p for p in all_pts if any(s in [sk.lower() for sk in (p.payload.get("skills") or [])] for s in matched_skills)]
                 print(f"Exact skill match found: {matched_skills}")
             else:
                 # semantic fallback
-                qvec = embedding_model.encode(query_text).tolist()
-                sem = qdrant_client.search(collection_name=COLLECTION_NAME, query_vector=qvec, limit=10, with_payload=True)
-                results = normalize_qdrant_points(sem)
+                try:
+                    qvec = embedding_model.encode(query_text).tolist()
+                    sem = qdrant_client.search(collection_name=COLLECTION_NAME, query_vector=qvec, limit=10, with_payload=True)
+                    results = normalize_qdrant_points(sem)
+                except Exception:
+                    results = []
                 print("No exact match, using semantic search.")
 
     if not results:
         print("No relevant information found.")
         return
 
+    # aggregate chunk-level points into candidate-level grouped dict
     grouped = aggregate_hits(results)
+
+    # If user named a candidate, narrow grouped to that candidate (so handlers operate on the intended person)
+    if name_from_query:
+        target = name_from_query.strip().lower()
+        filtered = {}
+        for cid, info in grouped.items():
+            cand_name = (info.get("candidate_name") or "").strip().lower()
+            if cand_name == target:
+                filtered[cid] = info
+        if filtered:
+            grouped = filtered
+
+    # personal/contact details handler: if query asks for contact info, handle and return
+    try:
+        if handle_personal_details_query(query_text, grouped):
+            return
+    except Exception as e:
+        # don't fail hard on handler error; continue with ranking fallback
+        print("Warning: personal-details handler error:", e)
+
+    # attempt to rank candidates intelligently if query contains skills/years/seniority
+    try:
+        did_rank = integrate_ranking_and_print_v2(grouped, query_text, all_skills)
+        if did_rank:
+            return
+    except Exception as e:
+        print("Ranking error:", e)
+
+    # fallback: print aggregated candidate info (no ranking requested)
     for key, info in grouped.items():
         print(f"\n📄 Files: {', '.join(info['filenames']) if info['filenames'] else 'Unknown'}")
         print(f"Candidate: {info.get('candidate_name')}")
@@ -775,15 +908,505 @@ def search_resumes(query_text):
             print("Context:", info['contexts'][0][:500].replace("\n", " ").strip(), "...")
         print("-" * 50)
 
-# ------------------ CLI ------------------
 
+
+# ------------------ Improved deterministic ranking (offline) ------------------
+
+import datetime, json
+
+
+# Configurable weights
+RANKING_WEIGHTS = {
+    "primary": 0.40,
+    "secondary": 0.10,
+    "seniority": 0.15,
+    "experience": 0.15,
+    "soft": 0.05,
+    "quality": 0.05,
+    "semantic": 0.10
+}
+
+# Skill synonyms loader (expects skills.txt lines like: python:py,python3)
+_SKILL_SYNONYMS = {}
+if os.path.exists(SKILLS_FILE):
+    try:
+        with open(SKILLS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip() or line.strip().startswith("#"):
+                    continue
+                parts = line.strip().split(":")
+                if len(parts) == 2:
+                    canon = parts[0].strip().lower()
+                    aliases = [a.strip().lower() for a in parts[1].split(",")]
+                    _SKILL_SYNONYMS[canon] = aliases
+    except Exception as e:
+        print("Warning: could not load skills file:", e)
+
+def normalize_skill(s: str) -> str:
+    s = s.lower().strip()
+    for canon, aliases in _SKILL_SYNONYMS.items():
+        if s == canon or s in aliases:
+            return canon
+    return s
+
+def skill_present(candidate: Dict, skill: str) -> bool:
+    sk = normalize_skill(skill)
+    allskills = [(normalize_skill(s) if s else "") for s in (candidate.get("skills_primary") or []) + (candidate.get("skills_secondary") or [])]
+    if sk in allskills:
+        return True
+    text_fields = " ".join([candidate.get("summary","") or ""] + (candidate.get("contexts") or [])).lower()
+    if re.search(r'\b' + re.escape(sk) + r'\b', text_fields):
+        return True
+    if sk in text_fields:
+        return True
+    return False
+
+# Improved experience parser
+_MONTH_MAP = {m.lower(): i+1 for i,m in enumerate(
+    ["jan","feb","mar","apr","may","jun","jul","aug","sep","sept","oct","nov","dec"]
+)}
+def parse_date_token(tok: str):
+    try:
+        low = tok.lower()
+        m = re.match(r'(\\w+)\\s+(\\d{4})', low)
+        if m:
+            mon = _MONTH_MAP.get(m.group(1)[:3], 1)
+            return datetime.date(int(m.group(2)), mon, 1)
+        if re.match(r'\\d{4}', low):
+            return datetime.date(int(low),1,1)
+        if re.match(r'\\d{2}/\\d{4}', low):
+            parts = low.split("/")
+            return datetime.date(int(parts[1]), int(parts[0]), 1)
+    except Exception:
+        return None
+    return None
+
+def compute_experience_years(experience_entries: list) -> float:
+    total_months = 0
+    for job in experience_entries or []:
+        dates = job.get("dates") or []
+        if len(dates) >= 2:
+            d1 = parse_date_token(dates[0])
+            d2 = parse_date_token(dates[-1])
+            if d1 and d2:
+                months = (d2.year - d1.year)*12 + (d2.month - d1.month)
+                if months > 0:
+                    total_months += months
+    return round(total_months/12.0,1) if total_months>0 else 0.0
+
+# Chunk-level semantic similarity
+def aggregate_chunk_similarities(contexts: list, query_text: str) -> float:
+    if not contexts:
+        return 0.0
+    try:
+        qv = _np.array(embedding_model.encode(query_text), dtype=_np.float32)
+        sims = []
+        for ctx in contexts[:10]:
+            sv = _np.array(embedding_model.encode(ctx), dtype=_np.float32)
+            denom = (_np.linalg.norm(qv) * _np.linalg.norm(sv))
+            if denom>0:
+                sims.append(float(_np.dot(qv, sv)/denom))
+        if not sims:
+            return 0.0
+        return 0.7*max(sims) + 0.3*(_np.mean(sorted(sims,reverse=True)[:3]))
+    except Exception:
+        return 0.0
+def compute_skill_fraction(candidate: Dict, req_skills: List[str]) -> float:
+    """Return fraction of required skills present in candidate's skills lists."""
+    if not req_skills:
+        return 0.0
+    # collect candidate skills normalized
+    skills = [s.lower() for s in (candidate.get("skills_primary") or []) + (candidate.get("skills_secondary") or [])]
+    if not skills:
+        # fallback: search candidate summary/contexts for skill tokens
+        text_fields = " ".join([candidate.get("summary","") or ""] + (candidate.get("contexts") or [])).lower()
+        matched = 0
+        for rs in req_skills:
+            if rs.lower() in text_fields:
+                matched += 1
+        return matched / len(req_skills) if matched else 0.0
+
+    matched = 0
+    for rs in req_skills:
+        rs_low = rs.lower()
+        # exact or contained match
+        if any(rs_low == s or rs_low in s or s in rs_low for s in skills):
+            matched += 1
+    return matched / len(req_skills)
+
+# Override compute_final_score to include improved exp + chunk sims
+def compute_final_score(candidate: Dict,
+                        req_primary: List[str],
+                        req_secondary: List[str],
+                        req_soft: List[str],
+                        req_min_years: float,
+                        req_seniority: str,
+                        query_text: str,
+                        weights: Dict[str, float] = None) -> Tuple[float, Dict]:
+    w = weights or RANKING_WEIGHTS
+
+    primary_score = compute_skill_fraction(candidate, req_primary)
+    secondary_score = compute_skill_fraction(candidate, req_secondary)
+    soft_score = compute_skill_fraction(candidate, req_soft)
+
+    rel_exp = candidate.get("relevant_experience_years", 0.0)
+    experience_score = clamp01(rel_exp / req_min_years) if req_min_years > 0 else clamp01(rel_exp/5.0)
+
+    seniority_score = seniority_match(candidate, req_seniority)
+    quality_score = clamp01(candidate.get("resume_quality_score", 0.5))
+
+    sem_score_chunks = aggregate_chunk_similarities(candidate.get("contexts", []), query_text)
+    semantic_score = sem_score_chunks
+
+    combined = (
+        w["primary"] * primary_score +
+        w["secondary"] * secondary_score +
+        w["seniority"] * seniority_score +
+        w["experience"] * experience_score +
+        w["soft"] * soft_score +
+        w["quality"] * quality_score +
+        w["semantic"] * semantic_score
+    )
+
+    final_score = clamp01(combined) * 100.0
+
+    breakdown = {
+        "primary": primary_score,
+        "secondary": secondary_score,
+        "seniority": seniority_score,
+        "experience": experience_score,
+        "soft": soft_score,
+        "quality": quality_score,
+        "semantic": semantic_score,
+        "final": final_score
+    }
+    return final_score, breakdown
+def seniority_match(candidate: Dict, req_seniority: str) -> float:
+    """Return a score [0,1] for how well candidate's seniority matches the requested one."""
+    if not req_seniority:
+        return 0.5  # neutral if not requested
+    cand_sen = (candidate.get("seniority_estimate") or "").lower()
+    req = req_seniority.lower()
+    if not cand_sen:
+        return 0.5
+    if cand_sen == req:
+        return 1.0
+    # related groupings: manager > senior > mid > junior
+    groups = {
+        "manager": ["manager", "director", "head", "vp", "vice president"],
+        "senior": ["senior", "sr", "lead", "principal", "staff"],
+        "mid": ["mid", "software engineer", "engineer"],
+        "junior": ["junior", "jr", "associate", "intern"]
+    }
+    # exact-match fallback otherwise approximate
+    if req in groups:
+        if any(tok in cand_sen for tok in groups[req]):
+            return 0.8
+    # partial matches
+    if req in cand_sen or cand_sen in req:
+        return 0.8
+    return 0.0
+def infer_seniority_from_text(text: str) -> str:
+    """Infer a seniority level from free-text (simple heuristic)."""
+    if not text:
+        return ""
+    low = text.lower()
+    if any(k in low for k in ("manager", "director", "head of", "vp ", "vice president")):
+        return "manager"
+    if any(k in low for k in ("senior", "sr.", "sr ", "lead", "principal", "staff", "distinguished")):
+        return "senior"
+    if any(k in low for k in ("junior", "jr.", "jr ", "entry", "associate", "intern")):
+        return "junior"
+    return "mid"
+
+# Enhance build_candidate_records_from_grouped to compute exp and carry contexts
+def build_candidate_records_from_grouped(grouped: Dict) -> List[Dict]:
+    candidates = []
+    for cid, info in grouped.items():
+        skills = sorted(list(info.get("skills") or []))
+        summary = ""
+        if info.get("sections") and isinstance(info.get("sections"), dict):
+            summary = info["sections"].get("summary", "") or (" ".join(info.get("contexts")[:2]) if info.get("contexts") else "")
+        exp_entries = info.get("experience", [])
+        years = compute_experience_years(exp_entries)
+        senior = infer_seniority_from_text(summary + " " + (info["sections"].get("experience","") if info.get("sections") else ""))
+        quality = 0.5
+        if info.get("emails") or info.get("phones"):
+            quality += 0.25
+        if len(skills) >= 3:
+            quality += 0.25
+        cand = {
+            "candidate_id": cid,
+            "name": info.get("candidate_name"),
+            "skills_primary": skills,
+            "skills_secondary": [],
+            "summary": summary,
+            "seniority_estimate": senior,
+            "relevant_experience_years": years,
+            "resume_quality_score": quality,
+            "contexts": info.get("contexts", [])
+        }
+        candidates.append(cand)
+    return candidates
+
+# Improved integrate_ranking_and_print to show evidence
+def integrate_ranking_and_print(grouped: Dict, query_text: str, all_skills: set):
+    candidates = build_candidate_records_from_grouped(grouped)
+    req_primary = []
+    try:
+        qdoc = nlp(query_text)
+        candidates_sk = set()
+        for nc in list(qdoc.noun_chunks) + [ent for ent in qdoc.ents]:
+            tok = normalize_token(nc.text)
+            if len(tok.split()) <= 5 and len(tok) > 1:
+                candidates_sk.add(tok)
+        for w in re.findall(r'\\w+', query_text.lower()):
+            if len(w) > 1:
+                candidates_sk.add(w)
+        for cand in sorted(candidates_sk, key=lambda s: -len(s)):
+            match = get_close_matches(cand, list(all_skills), n=1, cutoff=0.6)
+            if match and match[0] not in req_primary:
+                req_primary.append(match[0])
+    except Exception:
+        req_primary = [s for s in all_skills if s in query_text.lower()]
+    min_years = 0
+    m = re.search(r'(\\d+)\\s*\\+?\\s*(?:years|yrs)', query_text.lower())
+    if m:
+        min_years = int(m.group(1))
+    req_sen = ""
+    for s in ("senior","junior","mid","lead","manager"):
+        if s in query_text.lower():
+            req_sen = s; break
+
+    ranked = rank_candidates(candidates, req_primary, [], [], min_years, req_sen, query_text, top_k=20)
+    if not ranked:
+        print("No candidates to rank.")
+        return False
+    print("\\nRanked candidates (top results):")
+    for r in ranked:
+        print(f"{r.get('name','(no-name)')} - Score: {r.get('_score',0):.1f}")
+        bd = r.get("_breakdown",{})
+        print(f"  Breakdown: primary={bd.get('primary',0):.2f}, exp={bd.get('experience',0):.2f}, seniority={bd.get('seniority',0):.2f}, semantic={bd.get('semantic',0):.2f}")
+        print(f"  Skills: {r.get('skills_primary')}")
+        # show one evidence snippet
+        if r.get("contexts"):
+            snippet = r["contexts"][0][:250].replace("\\n"," ")
+            print(f"  Evidence: {snippet}...")
+        print("-"*50)
+    return True
+
+# ------------------ end improved ranking ------------------
+
+
+
+
+# ------------------ Enhanced resume ranking module (v2) ------------------
+from typing import List, Dict, Tuple
+import math, os, json, re
+import numpy as _np
+
+RANKING_WEIGHTS_V2 = {
+    "primary": 0.40,
+    "secondary": 0.10,
+    "seniority": 0.15,
+    "experience": 0.20,
+    "soft": 0.03,
+    "quality": 0.04,
+    "semantic": 0.08
+}
+
+EMB_CACHE_PATH = ".embedding_cache_v2.json"
+
+def _load_json(path):
+    try:
+        if os.path.exists(path):
+            with open(path,"r",encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return {}
+    return {}
+
+def _save_json(path, obj):
+    try:
+        with open(path,"w",encoding="utf-8") as f:
+            json.dump(obj, f)
+    except Exception:
+        pass
+
+_emb_cache_v2 = _load_json(EMB_CACHE_PATH)
+
+def semantic_similarity_v2(candidate: Dict, query_text: str, query_vec=None) -> float:
+    try:
+        if query_vec is None:
+            qvec = embedding_model.encode(query_text)
+        else:
+            qvec = _np.array(query_vec, dtype=_np.float32)
+        cid = candidate.get("candidate_id") or candidate.get("name") or ""
+        if cid in _emb_cache_v2:
+            cand_vec = _np.array(_emb_cache_v2[cid], dtype=_np.float32)
+        else:
+            texts = []
+            if candidate.get("summary"):
+                texts.append(candidate.get("summary"))
+            if candidate.get("contexts"):
+                texts.extend(candidate.get("contexts")[:6])
+            if not texts:
+                return 0.0
+            vecs = []
+            for t in texts:
+                try:
+                    v = embedding_model.encode(t)
+                    vecs.append(_np.array(v, dtype=_np.float32))
+                except Exception:
+                    continue
+            if not vecs:
+                return 0.0
+            cand_vec = _np.mean(_np.stack(vecs, axis=0), axis=0)
+            _emb_cache_v2[cid] = cand_vec.tolist()
+            _save_json(EMB_CACHE_PATH, _emb_cache_v2)
+        denom = (_np.linalg.norm(cand_vec) * _np.linalg.norm(_np.array(qvec, dtype=_np.float32)))
+        if denom == 0:
+            return 0.0
+        sim = float(_np.dot(cand_vec, _np.array(qvec, dtype=_np.float32)) / denom)
+        return clamp01((sim + 1.0) / 2.0)
+    except Exception:
+        # fallback
+        q_tokens = [t.lower() for t in re.findall(r'\w+', query_text) if len(t)>2]
+        if not q_tokens:
+            return 0.0
+        matched = 0
+        summary = candidate.get("summary","").lower()
+        for t in q_tokens:
+            if t in summary:
+                matched += 1
+        return clamp01(matched / len(q_tokens))
+
+def compute_final_score_v2(candidate: Dict,
+                        req_primary: List[str],
+                        req_secondary: List[str],
+                        req_soft: List[str],
+                        req_min_years: float,
+                        req_seniority: str,
+                        query_text: str,
+                        weights: Dict[str, float] = None,
+                        query_vec=None) -> Tuple[float, Dict]:
+    w = weights or RANKING_WEIGHTS_V2
+
+    primary_score = compute_skill_fraction(candidate, req_primary)
+    secondary_score = compute_skill_fraction(candidate, req_secondary)
+    soft_score = compute_skill_fraction(candidate, req_soft)
+
+    rel_exp = candidate.get("relevant_experience_years", 0.0)
+    experience_score = clamp01(rel_exp / req_min_years) if req_min_years > 0 else 1.0
+
+    seniority_score = 1.0 if req_seniority and req_seniority == candidate.get("seniority_estimate") else (0.6 if candidate.get("seniority_estimate") else 0.5)
+    quality_score = clamp01(candidate.get("resume_quality_score", 0.5))
+    semantic_score = semantic_similarity_v2(candidate, query_text, query_vec=query_vec)
+
+    combined = (
+        w["primary"] * primary_score +
+        w["secondary"] * secondary_score +
+        w["seniority"] * seniority_score +
+        w["experience"] * experience_score +
+        w["soft"] * soft_score +
+        w["quality"] * quality_score +
+        w["semantic"] * semantic_score
+    )
+
+    final_score = clamp01(combined) * 100.0
+    breakdown = {
+        "primary": primary_score, "secondary": secondary_score, "seniority": seniority_score,
+        "experience": experience_score, "soft": soft_score, "quality": quality_score, "semantic": semantic_score,
+        "final": final_score
+    }
+    return final_score, breakdown
+
+def rank_candidates_v2(candidates: List[Dict],
+                    req_primary: List[str],
+                    req_secondary: List[str],
+                    req_soft: List[str],
+                    req_min_years: float,
+                    req_seniority: str,
+                    query_text: str,
+                    top_k: int = 20) -> List[Dict]:
+    scored = []
+    qvec = None
+    try:
+        qvec = embedding_model.encode(query_text)
+    except Exception:
+        qvec = None
+    for c in candidates:
+        sc, breakdown = compute_final_score_v2(c, req_primary, req_secondary, req_soft, req_min_years, req_seniority, query_text, query_vec=qvec)
+        entry = c.copy()
+        entry["_score"] = sc
+        entry["_breakdown"] = breakdown
+        scored.append(entry)
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    return scored[:top_k]
+
+def integrate_ranking_and_print_v2(grouped: Dict, query_text: str, all_skills: set):
+    # build candidate records using existing builder
+    candidates = build_candidate_records_from_grouped(grouped)
+    # extract requested skills similar to previous approach
+    req_primary = []
+    try:
+        qdoc = nlp(query_text)
+        candidates_set = set()
+        for nc in list(qdoc.noun_chunks) + [ent for ent in qdoc.ents]:
+            tok = normalize_token(nc.text)
+            if len(tok.split()) <= 5 and len(tok) > 1:
+                candidates_set.add(tok)
+        for w in re.findall(r'\w+', query_text.lower()):
+            if len(w) > 1:
+                candidates_set.add(w)
+        for cand in sorted(candidates_set, key=lambda s: -len(s)):
+            match = get_close_matches(cand, list(all_skills), n=1, cutoff=0.6)
+            if match and match[0] not in req_primary:
+                req_primary.append(match[0])
+    except Exception:
+        req_primary = [s for s in all_skills if s in query_text.lower()]
+
+    m = re.search(r'(\d+)\s*\+?\s*(?:years|yrs)', query_text.lower())
+    min_years = int(m.group(1)) if m else 0
+    req_sen = ""
+    for s in ("senior","junior","mid","lead","manager"):
+        if s in query_text.lower():
+            req_sen = s; break
+
+    if not (req_primary or min_years or req_sen):
+        return False
+
+    ranked = rank_candidates_v2(candidates, req_primary, [], [], min_years, req_sen, query_text, top_k=20)
+    if not ranked:
+        print("No candidates to rank.")
+        return True
+
+    print("\nRanked candidates (v2) (top results):")
+    for r in ranked:
+        print(f"{r.get('name','(no-name)')} - Score: {r.get('_score',0):.1f}")
+        bd = r.get("_breakdown",{})
+        print(f"  Breakdown: primary={bd.get('primary',0):.2f}, experience={bd.get('experience',0):.2f}, seniority={bd.get('seniority',0):.2f}, semantic={bd.get('semantic',0):.2f}")
+        print(f"  Years: {r.get('relevant_experience_years')} | Seniority: {r.get('seniority_estimate')} | Quality: {r.get('resume_quality_score')}")
+        if r.get('skills_primary'):
+            print(f"  Skills: {r.get('skills_primary')}")
+        if r.get('evidence'):
+            print("  Evidence:")
+            for ev in r.get('evidence',[])[:3]:
+                print("   -", ev.strip()[:240].replace('\\n',' '))
+        print("-"*40)
+    return True
 if __name__ == "__main__":
+    SKIP_INGEST = os.getenv("SKIP_INGEST", "0") in ("1", "true", "True")
+
     # ensure resume folder exists
     if not os.path.exists(RESUME_FOLDER):
         os.makedirs(RESUME_FOLDER, exist_ok=True)
         print(f"Please add resumes to the '{RESUME_FOLDER}' directory (pdf/docx/txt) and re-run.")
     else:
-        ingest_resumes()
+        if not SKIP_INGEST:
+            ingest_resumes()
+        else:
+            print("Skipping ingestion (SKIP_INGEST set). Using existing Qdrant data.")
 
     print("\n--- AI Resume Analyzer (section-aware) ---")
     print("Examples: 'what are certifications', 'what skills does dexter have', 'provide me pranay reddy personal details'")
@@ -801,6 +1424,12 @@ if __name__ == "__main__":
             print("Goodbye.")
             break
         search_resumes(q)
+
+
+
+
+
+
 
 
 
