@@ -1,0 +1,6 @@
+{
+  "input_text": "Technical Skillset\n Blockchain | Digital Assets | Sitecore | Backbase | SAP – FI, CO, SD, MM, PP | S/4 HANA\n Responsive Web | Mobile Apps | Clarity | ServiceNow | EPIC | ETL | Big Data | Hadoop\n AWS | Azure | Azure DevOps (TFS) | Docker | Kubernetes | Mesos | GIT | Subversion\n Oracle Cloud | TIBCO | Salesforce | Microsoft Dynamics | Comburent | Pega DSM\n Office 365 | Microsoft Office Suite | Visio | Adobe Workfront | Hyperion | Jira | Coupa\n IBM Identity Security Access Manager | Shape Security | Cloudflare | Key Cloak | BioCatch\n",
+  "model_available": false,
+  "extracted_skills": [],
+  "error": "skill_pipe is not initialized (model missing)."
+}
