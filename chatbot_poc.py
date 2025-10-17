@@ -19,6 +19,7 @@ from collections import defaultdict
 import uuid
 import datetime 
 import re as _re
+from model import init_skill_model 
 
 # ---------------- Optional deps (guarded imports) ----------------
 try:
@@ -56,17 +57,12 @@ except Exception:
     RAPIDFUZZ = False
 
 # import model initializer (your local model.py)
-try:
-    from model import init_skill_model
-except Exception as e:
-    init_skill_model = None
-    print("Warning: could not import init_skill_model from model.py:", e)
 
 # ---------------- CONFIG ----------------
 HF_LOCAL_SNAPSHOT = None
 
 # Default to a small, fast model; can override via EMBEDDING_MODEL env var
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "google/gemma-3-270m-it")
 
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
@@ -92,15 +88,30 @@ else:
         def ents(self): return []
     nlp = _Dummy()
 
-# ---------------- init skill model (amjad/jobbert etc.) ----------------
+# ---------------- init skill model (force Gemma, transformers backend) ----------------
 skill_pipe = None
 if init_skill_model is not None:
     try:
-        skill_pipe = init_skill_model(local_snapshot=HF_LOCAL_SNAPSHOT, device=-1)
+        # Force the Gemma model and transformers backend explicitly to ensure 640-dim vectors
+        skill_pipe = init_skill_model(
+            model_id=EMBEDDING_MODEL,     # EMBEDDING_MODEL defaults to "google/gemma-3-270m-it"
+            backend="transformers",       # force transformers/Gemma (not sentence-transformers)
+            device=None,                  # None => auto select 'cuda' if available else 'cpu'
+            normalize=True                # keep L2 normalization as implemented in model.py
+        )
     except Exception as e:
-        print("init_skill_model error:", e)
+        print("init_skill_model error (forcing Gemma):", e)
         skill_pipe = None
-print("skill_pipe available:", bool(skill_pipe))
+
+# show what we initialized (helpful debug)
+if skill_pipe is not None:
+    try:
+        print("skill_pipe initialized. embedding dim:", skill_pipe.get_sentence_embedding_dimension())
+    except Exception:
+        print("skill_pipe initialized (dimension unknown).")
+else:
+    print("skill_pipe available: False")
+
 
 # ---------------- Embeddings backend (SentenceTransformer OR Gemma) ----------------
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -476,67 +487,93 @@ def canonicalize_heading(h: str):
         pass
     return h.lower().strip()
 
-# ---------------- Skill extraction ----------------
 def extract_skills_from_section(text: str) -> List[str]:
     """
-    Conservative heuristic extractor:
-      - prefer explicit comma/pipe/slash lists
-      - capture multi-word phrases (2+ words)
-      - allow single-word tokens only when they look tech-like (contain digits or common tech substrings)
-      - return lower-cased cleaned tokens (no fuzzy mapping here)
+    Conservative heuristic extractor with BETTER filtering.
+    - Prefers explicit comma/pipe/slash lists
+    - Filters out section headers and meta text
+    - Only returns actual technical/soft skills
     """
     if not text:
         return []
-    lines = [ln.strip(" \t•·-:") for ln in text.splitlines() if ln.strip()]
+    
+    lines = [ln.strip(" \tâ€¢Â·-:") for ln in text.splitlines() if ln.strip()]
     skills = []
-    tech_whitelist_subs = ("js","py","python","sql","aws","azure","gcp","c#","csharp","c++","cpp","java","scala",
-                           "spark","hadoop","react","node","django","flask","linux","k8s","kubernetes","docker",
-                           "php","html","css","json","xml","git","jira","mysql","postgres","oracle","mongodb",
-                           "nosql","jenkins","ansible","terraform","tableau","powerbi","pyspark","dbt","databricks")
-
+    
+    # Known tech substrings to help identify real skills
+    tech_whitelist_subs = (
+        "js","py","python","sql","aws","azure","gcp","c#","csharp","c++","cpp","java","scala",
+        "spark","hadoop","react","node","django","flask","linux","k8s","kubernetes","docker",
+        "php","html","css","json","xml","git","jira","mysql","postgres","oracle","mongodb",
+        "nosql","jenkins","ansible","terraform","tableau","powerbi","pyspark","dbt","databricks"
+    )
+    
+    # Meta keywords to SKIP (not actual skills)
+    skip_patterns = re.compile(
+        r'^\s*(experience|years?|month|week|day|project|tool|platform|'
+        r'framework|library|package|software|application|system|'
+        r'certification|certificate|license|degree|award|certification|'
+        r'languages?|technologies?|skills?|expertise|proficiency)\s*:?\s*$',
+        re.IGNORECASE
+    )
+    
     for ln in lines:
-        # keep explicit short lists first
+        # Skip lines that are section headers or meta-text
+        if skip_patterns.match(ln):
+            continue
+        
+        # Skip very long lines (likely descriptions, not skill lists)
+        if len(ln.split()) > 20:
+            continue
+        
+        # Handle explicit lists (comma/semicolon separated)
         if (',' in ln or ';' in ln) and len(ln) < 400:
             parts = [p.strip() for p in re.split(r'[,;]+', ln) if p.strip()]
             for p in parts:
-                if len(p.split()) <= 12:
+                if 2 <= len(p.split()) <= 6:  # Multi-word skills OK
                     skills.append(p.lower())
             continue
-
-        # separators like | / · often used in tables
-        if any(sep in ln for sep in ['|','/','·','•']):
-            parts = re.split(r'[|/·•]', ln)
+        
+        # Handle pipe/bullet separated lists
+        if any(sep in ln for sep in ['|', '/', 'Â·', 'â€¢']):
+            parts = re.split(r'[|/Â·â€¢]', ln)
             for p in parts:
                 p = p.strip()
-                if p and len(p.split()) <= 12:
+                if p and 2 <= len(p.split()) <= 6:
                     skills.append(p.lower())
             continue
-
-        # multi-word phrases (prefer these)
+        
+        # Multi-word phrases (prefer these)
         mw = re.findall(r'\b[A-Za-z0-9\+\-#\.]{2,}(?:[ \t]+[A-Za-z0-9\+\-#\.]{2,})+\b', ln)
         for m in mw:
             skills.append(m.strip().lower())
-
-        # single-word tokens only if they seem tech-like
+        
+        # Single-word tokens ONLY if they look tech-like
         sw = re.findall(r'\b[a-zA-Z0-9\+\-#\.]{2,}\b', ln)
         for s in sw:
             s_l = s.strip().lower()
+            # Include if: has digits OR contains known tech substring
             if re.search(r'\d', s_l) or any(x in s_l for x in tech_whitelist_subs):
                 skills.append(s_l)
-
-    # dedupe while preserving order, and filter out noise tokens
+    
+    # Clean and dedupe
     seen = set()
     out = []
     for s in skills:
         s2 = re.sub(r'^[\W_]+|[\W_]+$', '', s).strip()
-        if not s2:
+        if not s2 or len(s2) <= 1:
             continue
-        if len(s2) <= 1:
+        
+        # Skip stopwords and non-skills
+        if s2 in ("and", "or", "with", "experience", "years", "year", "skills", "skill",
+                  "the", "a", "an", "in", "of", "for", "is", "are", "technologies",
+                  "knowledge", "expertise", "proficiency"):
             continue
-        if s2 in ("and", "or", "with", "experience", "years", "year", "skills", "skill"):
-            continue
+        
         if s2 not in seen:
-            seen.add(s2); out.append(s2)
+            seen.add(s2)
+            out.append(s2)
+    
     return out
 
 def extract_skills_from_section_combined(section_text: str, full_text: str = "") -> List[str]:
@@ -876,29 +913,55 @@ def extract_locations_from_text(text: str):
         return []
 
 def extract_candidate_name_from_text(full_text: str, filename: str = None):
+    """
+    Improved name extraction that skips section headings.
+    Checks first 15 lines for a line that looks like a name (not a heading).
+    """
     lines = [ln.strip() for ln in (full_text or "").splitlines() if ln.strip()]
-    skip_kw = re.compile(r'(?i)\b(resume|cv|curriculum vitae|profile|project history|objective|summary|contact|phone|email|address|linkedin|github)\b')
-    for ln in lines[:12]:
-        if skip_kw.search(ln): continue
+    skip_kw = re.compile(
+        r'(?i)\b(resume|cv|curriculum vitae|profile|project|objective|summary|contact|'
+        r'phone|email|address|linkedin|github|technical|manager|engineer|developer|'
+        r'architect|specialist|lead|senior|junior|associate|coordinator|analyst)\b'
+    )
+    
+    # Check first 15 lines for name-like content
+    for ln in lines[:15]:
+        # Skip if line contains keywords suggesting it's a heading/title
+        if skip_kw.search(ln):
+            continue
+        
         words = ln.split()
-        if 1 < len(words) <= 4 and not any(ch.isdigit() for ch in ln):
-            if all((w and w[0].isupper()) for w in words) or ln.isupper():
+        
+        # Name heuristic: 1-4 words, all capitalized, no digits, length < 80
+        if (1 <= len(words) <= 4 and 
+            len(ln) < 80 and
+            not any(ch.isdigit() for ch in ln)):
+            
+            # All words start with capital (but allow "van", "de", etc.)
+            if all((w and w[0].isupper()) for w in words):
                 return " ".join([w.capitalize() for w in ln.split()])
+    
+    # Fallback: try spaCy NER if available
     try:
         doc = nlp("\n".join(lines[:30]))
-        persons = [ent.text.strip() for ent in getattr(doc, "ents", []) if getattr(ent, "label_", "") == "PERSON"]
+        persons = [ent.text.strip() for ent in getattr(doc, "ents", []) 
+                  if getattr(ent, "label_", "") == "PERSON"]
         for p in sorted(persons, key=lambda s: -len(s)):
             if not skip_kw.search(p):
                 return p
     except Exception:
         pass
+    
+    # Fallback: clean filename
     if filename:
         base = os.path.splitext(os.path.basename(filename))[0]
         base_clean = re.sub(r'[_\-.]+', ' ', base)
-        base_clean = re.sub(r'(?i)\b(resume|cv|final|de|profile)\b', '', base_clean)
+        base_clean = re.sub(r'(?i)\b(resume|cv|final|de|profile|pdf|docx)\b', '', base_clean)
         if base_clean.strip():
             return " ".join([w.capitalize() for w in base_clean.split()])
+    
     return "Unknown"
+
 
 try:
     from dateutil import parser as _dateutil_parser
@@ -936,20 +999,22 @@ def _try_parse_date_token(token: str):
         except Exception:
             pass
     return None
-
-# helper: merge intervals and compute total years
 def _merge_intervals_and_total_years(intervals):
     """
-    intervals: list of (start_date: date, end_date: date) where end_date >= start_date
-    returns total_years (float, 1 decimal)
+    Merge overlapping intervals and compute total years.
+    intervals: list of (start_date, end_date) tuples
+    returns: float years (1 decimal)
     """
     if not intervals:
         return 0.0
-    # normalize (ensure dates)
+    
     clean = [(s, e) for (s, e) in intervals if s and e and e >= s]
     if not clean:
         return 0.0
+    
     clean.sort(key=lambda x: x[0])
+    
+    # Merge overlapping intervals
     merged = []
     cur_s, cur_e = clean[0]
     for s, e in clean[1:]:
@@ -959,129 +1024,161 @@ def _merge_intervals_and_total_years(intervals):
             merged.append((cur_s, cur_e))
             cur_s, cur_e = s, e
     merged.append((cur_s, cur_e))
+    
+    # Sum total days
     total_days = sum((e - s).days for s, e in merged)
     years = round(total_days / 365.0, 1)
-    # clamp to a sensible max (avoid bad parsing causing huge numbers)
-    if years > 60:
-        years = 60.0
+    
+    # Sanity checks
     if years < 0:
         years = 0.0
+    elif years > 60:
+        years = 60.0
+    
     return float(years)
 
-# main replacement for extract_experience_from_section
 def extract_experience_from_section(text: str):
     """
-    Parse an 'Experience' section into structured entries with dates + durations.
-    Returns list of dicts: raw, title, company, start_date (ISO), end_date (ISO or 'Present'),
-    duration_years (float), location, summary.
+    Improved experience parsing with robust date handling and duration calculation.
+    Returns list of experience entries with calculated duration_years.
     """
     if not text or not isinstance(text, str):
         return []
 
     paras = [p.strip() for p in _re.split(r'\n{2,}', text) if p.strip()]
     out = []
-    # regex for common range patterns
+    
+    # More flexible date patterns
     RANGE_RE = _re.compile(
-        r'(?P<start>(?:[A-Za-z]{3,9}\.?\s*\d{4}|\d{1,2}[\/\-]\d{4}|\d{4}))\s*(?:[-–—]|to)\s*(?P<end>(?:Present|present|current|Current|[A-Za-z]{3,9}\.?\s*\d{4}|\d{1,2}[\/\-]\d{4}|\d{4}))',
+        r'(?P<start>(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{4}|'
+        r'\d{1,2}/\d{4}|\d{4})\s*'
+        r'(?:[-â€"to\s]+|–)\s*'
+        r'(?P<end>Present|present|Current|current|Now|now|'
+        r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{4}|'
+        r'\d{1,2}/\d{4}|\d{4})',
         flags=_re.IGNORECASE
     )
+    
+    # Explicit duration mention
     YEARS_RE = _re.compile(r'(\d+(?:\.\d+)?)\s+years?', flags=_re.IGNORECASE)
+    
+    MONTH_MAP = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+    }
+
+    def parse_date(date_str):
+        """Parse a date string to datetime.date object."""
+        date_str = (date_str or "").strip().lower()
+        if not date_str:
+            return None
+        
+        if date_str in ('present', 'current', 'now'):
+            return datetime.date.today()
+        
+        # "Jan 2020" format
+        m = _re.match(r'([a-z]{3})[a-z]*\.?\s*(\d{4})', date_str)
+        if m:
+            month_str, year = m.groups()
+            month = MONTH_MAP.get(month_str[:3], 1)
+            try:
+                return datetime.date(int(year), month, 1)
+            except:
+                return None
+        
+        # "01/2020" format
+        m = _re.match(r'(\d{1,2})/(\d{4})', date_str)
+        if m:
+            month, year = m.groups()
+            try:
+                return datetime.date(int(year), int(month), 1)
+            except:
+                return None
+        
+        # Year only "2020"
+        m = _re.match(r'(\d{4})', date_str)
+        if m:
+            try:
+                return datetime.date(int(m.group(1)), 1, 1)
+            except:
+                return None
+        
+        return None
+
+    def calculate_duration(start_date, end_date):
+        """Calculate duration in years between two dates."""
+        if not start_date or not end_date or end_date < start_date:
+            return None
+        
+        delta = end_date - start_date
+        years = delta.days / 365.25
+        return round(max(0.1, years), 1)  # Minimum 0.1 years
 
     for p in paras:
-        entry = {"raw": p, "title": "", "company": "", "start_date": None, "end_date": None, "duration_years": None, "location": "", "summary": p}
+        entry = {
+            "raw": p,
+            "title": "",
+            "company": "",
+            "start_date": None,
+            "end_date": None,
+            "duration_years": None,
+            "location": "",
+            "summary": p
+        }
+        
+        # Try to find date range
         m = RANGE_RE.search(p)
         if m:
-            start_tok = m.group("start")
-            end_tok = m.group("end")
-            sdate = _try_parse_date_token(start_tok)
-            edate = _try_parse_date_token(end_tok)
-            if sdate == "PRESENT":
-                sdate = None
-            if edate == "PRESENT":
-                edate = datetime.date.today()
-            # if parse produced date objects, store ISO strings; else keep tokens
-            if isinstance(sdate, datetime.date):
-                entry["start_date"] = sdate.isoformat()
-            else:
-                entry["start_date"] = None
-            if isinstance(edate, datetime.date):
-                entry["end_date"]= edate.isoformat()
-            else:
-                entry["end_date"] = None
-            # duration if both
-            try:
-                if isinstance(sdate, datetime.date) and isinstance(edate, datetime.date):
-                    days = (edate - sdate).days
-                    years = round(days / 365.0, 1) if days >= 0 else 0.0
-                    entry["duration_years"] = float(min(years, 60.0))
-            except Exception:
-                entry["duration_years"] = None
-        else:
-            # try "X years" phrasing
+            start_str = m.group("start")
+            end_str = m.group("end")
+            
+            start_date = parse_date(start_str)
+            end_date = parse_date(end_str)
+            
+            if start_date:
+                entry["start_date"] = start_date.isoformat()
+            if end_date:
+                entry["end_date"] = end_date.isoformat()
+            
+            # Calculate duration
+            if start_date and end_date:
+                duration = calculate_duration(start_date, end_date)
+                if duration:
+                    entry["duration_years"] = duration
+        
+        # Fallback: look for explicit "X years" mention
+        if entry["duration_years"] is None:
             my = YEARS_RE.search(p)
             if my:
                 try:
-                    yrs = float(my.group(1))
-                    entry["duration_years"] = float(min(round(yrs, 1), 60.0))
-                except Exception:
-                    entry["duration_years"] = None
-
-        # best-effort extract first-line title/company (heuristic)
-        first_line = (p.splitlines() or [""])[0]
-        # patterns like "Title - Company", "Company — Title", "Company, Title", "Title, Company"
-        if " - " in first_line or " — " in first_line or " – " in first_line:
-            parts = _re.split(r'\s*[-–—]\s*', first_line)
-            if len(parts) >= 2:
-                # heuristics: if first token contains words like Inc/LLC/Corp then it's company
-                left, right = parts[0].strip(), parts[-1].strip()
-                if any(x in left.lower() for x in ("inc", "llc", "ltd", "corp", "co.", "company")):
+                    years = float(my.group(1))
+                    entry["duration_years"] = round(min(60.0, max(0.1, years)), 1)
+                except:
+                    pass
+        
+        # Extract title and company from first line
+        first_line = (p.splitlines() or [""])[0].strip()
+        
+        if ' - ' in first_line or ' â€" ' in first_line:
+            parts = _re.split(r'\s*[-â€"]\s*', first_line, maxsplit=1)
+            if len(parts) == 2:
+                left, right = parts[0].strip(), parts[1].strip()
+                if any(x in left.lower() for x in ('inc', 'llc', 'ltd', 'corp', 'company', 'group', 'systems', 'services')):
                     entry["company"] = left
                     entry["title"] = right
                 else:
                     entry["title"] = left
                     entry["company"] = right
-            else:
-                entry["title"] = first_line.strip()
-        elif "," in first_line:
-            # "Title, Company" or "Company, Location"
-            parts = [s.strip() for s in first_line.split(",") if s.strip()]
-            if len(parts) >= 2:
-                entry["title"] = parts[0]
-                entry["company"] = parts[1]
-            else:
-                entry["title"] = first_line.strip()
+        elif '|' in first_line:
+            parts = first_line.split('|', maxsplit=1)
+            entry["title"] = parts[0].strip()
+            entry["company"] = parts[1].strip() if len(parts) > 1 else ""
         else:
-            entry["title"] = first_line.strip()
-
+            entry["title"] = first_line
+        
         out.append(entry)
-
-    # Compute merged total years and add that as metadata on the returned entries (not required but helpful)
-    intervals = []
-    for e in out:
-        sd = e.get("start_date")
-        ed = e.get("end_date")
-        try:
-            if sd:
-                s = datetime.date.fromisoformat(sd)
-                if ed:
-                    try:
-                        ee = datetime.date.fromisoformat(ed)
-                    except Exception:
-                        ee = datetime.date.today()
-                else:
-                    # no end => assume present
-                    ee = datetime.date.today()
-                if s and ee and ee >= s:
-                    intervals.append((s, ee))
-        except Exception:
-            continue
-    total_years = _merge_intervals_and_total_years(intervals)
-    # attach total_years to the first entry for quick access (up to you)
-    if out:
-        out_meta = {"total_years_experience": float(total_years)}
-        # you can choose to return meta separately; currently we just attach to parsed later
+    
     return out
-
 def categorize_skills_for_resume(skills: List[str], full_text: str = "") -> Dict[str, Any]:
     technical_out: Dict[str, List[str]] = {k: [] for k in [
         "programming_languages","cloud","databases","data_engineering","devops_ci_cd",
@@ -1264,6 +1361,74 @@ def compute_role_relevance(query: str, candidate_text: str, embedding_model) -> 
         
     except Exception as e:
         return 0.0
+def compute_semantic_relevance(query: str, candidate_text: str, embedding_model) -> float:
+    """
+    Direct semantic relevance between query and candidate.
+    No templates, no keywords - pure embedding similarity.
+    
+    Returns: relevance score [0.0, 1.0]
+    """
+    if not query or not candidate_text:
+        return 0.0
+    
+    try:
+        # Embed both query and candidate text
+        query_vec = _np.array(embedding_model.encode(query.strip()), dtype=_np.float32)
+        
+        # Use a larger chunk of candidate text for better context
+        candidate_vec = _np.array(
+            embedding_model.encode(candidate_text[:3000].strip()), 
+            dtype=_np.float32
+        )
+        
+        # Normalize vectors
+        query_vec = query_vec / (_np.linalg.norm(query_vec) + 1e-9)
+        candidate_vec = candidate_vec / (_np.linalg.norm(candidate_vec) + 1e-9)
+        
+        # Compute cosine similarity
+        similarity = float(_np.dot(query_vec, candidate_vec))
+        
+        return max(0.0, min(1.0, similarity))
+        
+    except Exception as e:
+        return 0.0
+
+
+def compute_section_relevance(query: str, sections: Dict[str, str], embedding_model) -> Dict[str, float]:
+    """
+    Compute relevance for each resume section.
+    Helps identify which parts of resume match the query best.
+    """
+    section_scores = {}
+    
+    if not query or not sections:
+        return section_scores
+    
+    try:
+        query_vec = _np.array(embedding_model.encode(query.strip()), dtype=_np.float32)
+        query_vec = query_vec / (_np.linalg.norm(query_vec) + 1e-9)
+        
+        for section_name, section_text in sections.items():
+            if not section_text or len(str(section_text).strip()) < 20:
+                continue
+            
+            try:
+                section_vec = _np.array(
+                    embedding_model.encode(str(section_text)[:1000]), 
+                    dtype=_np.float32
+                )
+                section_vec = section_vec / (_np.linalg.norm(section_vec) + 1e-9)
+                
+                similarity = float(_np.dot(query_vec, section_vec))
+                section_scores[section_name] = max(0.0, min(1.0, similarity))
+            except:
+                continue
+        
+        return section_scores
+        
+    except Exception:
+        return section_scores
+
 
 def semantic_search(query: str,
                     top_k: int = 20,
@@ -1272,27 +1437,25 @@ def semantic_search(query: str,
                     filter_candidate_name: Optional[str] = None,
                     filter_location: Optional[str] = None,
                     filter_skill: Optional[str] = None,
-                    min_years_experience: Optional[float] = None) -> List[Dict[str, Any]]:
+                    min_years_experience: Optional[float] = None,
+                    relevance_threshold: float = 0.30) -> List[Dict[str, Any]]:
     """
-    Semantic search with optional structured post-filters.
-
-    New filters:
-      - filter_skill: exact (case-insensitive) membership checked against payload['skills_set'] or payload['skills'] or full_text.
-      - filter_location: substring match against payload['locations'] entries (case-insensitive).
-      - min_years_experience: numeric cutoff checked against payload['total_years_experience'] (best-effort).
+    Pure semantic search - with better fallback handling.
     """
     import uuid
     from collections import defaultdict
-    import numpy as _np
-
+    
     global qdrant_client, embedding_model, QDRANT_COLLECTION
-
+    
     if qdrant_client is None or embedding_model is None:
         if debug:
             print("[semantic_search] qdrant_client or embedding_model not initialized.")
         return []
-
-    # 1) embed query
+    
+    if debug:
+        print(f"[semantic_search] Query: '{query}', Threshold: {relevance_threshold}")
+    
+    # 1) Embed query
     try:
         qv = embedding_model.encode(query)
         qv = _np.asarray(qv, dtype=float).flatten()
@@ -1305,55 +1468,27 @@ def semantic_search(query: str,
         if debug:
             print("[semantic_search] embedding failed:", e)
         return []
-
-    # 2) call Qdrant (support multiple client signatures)
+    
+    # 2) Call Qdrant
     resp = None
     try:
         resp = qdrant_client.search(
             collection_name=QDRANT_COLLECTION,
             query_vector=qv,
-            limit=max(qdrant_limit, top_k),
+            limit=max(qdrant_limit, top_k * 15),
             with_payload=True
         )
-    except TypeError:
-        try:
-            resp = qdrant_client.search(
-                collection_name=QDRANT_COLLECTION,
-                vector=qv,
-                top=max(qdrant_limit, top_k),
-                with_payload=True
-            )
-        except Exception:
-            try:
-                resp = qdrant_client.query_points(
-                    collection_name=QDRANT_COLLECTION,
-                    vector=qv,
-                    limit=max(qdrant_limit, top_k),
-                    with_payload=True
-                )
-            except Exception as e:
-                if debug:
-                    print("[semantic_search] Qdrant search fallback failed:", e)
-                return []
     except Exception as e:
-        try:
-            resp = qdrant_client.query_points(
-                collection_name=QDRANT_COLLECTION,
-                vector=qv,
-                limit=max(qdrant_limit, top_k),
-                with_payload=True
-            )
-        except Exception as e2:
-            if debug:
-                print("[semantic_search] Qdrant search error:", e, e2)
-            return []
-
+        if debug:
+            print("[semantic_search] Qdrant search failed:", e)
+        return []
+    
     if not resp:
         if debug:
             print("[semantic_search] no hits from qdrant.")
         return []
-
-    # 3) normalize hits
+    
+    # 3) Normalize hits
     hits = []
     for r in resp:
         payload = {}
@@ -1362,55 +1497,31 @@ def semantic_search(query: str,
         if hasattr(r, "payload"):
             payload = r.payload or {}
             score = getattr(r, "score", None)
-            pid = getattr(r, "id", None) or getattr(r, "point_id", None)
+            pid = getattr(r, "id", None)
         elif isinstance(r, dict):
-            payload = r.get("payload") or r.get("point", {}).get("payload") or {}
+            payload = r.get("payload") or {}
             score = r.get("score")
-            pid = r.get("id") or r.get("point", {}).get("id")
-        else:
-            # try best-effort extraction
-            try:
-                payload = dict(getattr(r, "payload", {}) or {})
-                score = float(getattr(r, "score", 0.0))
-                pid = str(getattr(r, "id", "") or "")
-            except Exception:
-                continue
-
-        # normalize payload keys to safe types
-        payload = payload or {}
-
-        # apply quick metadata filters at chunk-level (optional prefilter to reduce candidates)
-        if filter_candidate_name:
-            cn = (payload.get("candidate_name") or "").strip().lower()
-            if filter_candidate_name.lower() not in cn:
-                continue
-
-        if filter_location:
-            locs = payload.get("locations") or payload.get("locations_extracted") or []
-            if isinstance(locs, str):
-                locs = [locs]
-            locs_low = [str(l).lower() for l in locs if l]
-            if not any(filter_location.lower() in l for l in locs_low):
-                # if not found at chunk-level, keep it for aggregation (some chunks may not carry location)
-                pass
-
-        # numeric score fallback
+            pid = r.get("id")
+        
         try:
             numeric_score = float(score) if score is not None else 0.0
         except Exception:
             numeric_score = 0.0
-
+        
         hits.append({"id": pid, "score": numeric_score, "payload": payload})
-
-    # 4) aggregate hits into candidate-level results with DYNAMIC boosting
-    def aggregate_by_candidate(hits_list, top_n=3, metadata_boost_roles=None):
+    
+    if debug:
+        print(f"[semantic_search] Got {len(hits)} raw hits from Qdrant")
+    
+    # 4) Aggregate by candidate
+    def aggregate_candidates(hits_list, query_text, threshold):
         scores_by_candidate = defaultdict(list)
         payload_by_candidate = {}
         
-        # Step 1: Group chunks by candidate
         for h in hits_list:
             pl = h.get("payload") or {}
-            cid = (pl.get("candidate_id") or pl.get("email") or pl.get("candidate_name") or h.get("id") or str(uuid.uuid4()))
+            cid = (pl.get("candidate_id") or pl.get("email") or 
+                   pl.get("candidate_name") or h.get("id") or str(uuid.uuid4()))
             cid = str(cid).strip().lower()
             s = float(h.get("score") or 0.0)
             scores_by_candidate[cid].append(s)
@@ -1418,91 +1529,135 @@ def semantic_search(query: str,
             prev = payload_by_candidate.get(cid)
             if prev is None or s > max(scores_by_candidate[cid][:-1], default=0):
                 payload_by_candidate[cid] = pl
-
-        # Step 2: Compute dynamic scores
+        
         aggregated = []
+        
         for cid, sc_list in scores_by_candidate.items():
+            pl = payload_by_candidate[cid] or {}
+            
+            # Get candidate context
+            full_text = pl.get("full_text") or ""
+            sections = pl.get("sections") or {}
+            skills = pl.get("skills_set") or pl.get("skills") or []
+            
+            # Build candidate text
+            candidate_context_parts = []
+            
+            if sections.get("summary"):
+                candidate_context_parts.append(str(sections["summary"])[:500])
+            if sections.get("experience"):
+                candidate_context_parts.append(str(sections["experience"])[:1500])
+            
+            if isinstance(skills, list):
+                skills_text = " ".join([str(s) for s in skills[:50] if s])
+                candidate_context_parts.append(f"Skills: {skills_text}")
+            
+            if not candidate_context_parts and full_text:
+                candidate_context_parts.append(full_text[:2000])
+            
+            candidate_text = " ".join(candidate_context_parts)
+            
+            # Compute semantic relevance (with fallback)
+            try:
+                semantic_score = compute_semantic_relevance(
+                    query_text, 
+                    candidate_text, 
+                    embedding_model
+                )
+            except Exception as e:
+                if debug:
+                    print(f"[semantic] compute_semantic_relevance failed for {pl.get('candidate_name')}: {e}")
+                # FALLBACK: use vector similarity instead of failing
+                semantic_score = max(sc_list) if sc_list else 0.0
+            
+            # Don't filter yet - compute full score first
             sc_sorted = sorted(sc_list, reverse=True)
-            top_scores = sc_sorted[:top_n] if sc_sorted else [0.0]
-            base_score = sum(top_scores) / max(1, len(top_scores))
+            top_chunk_scores = sc_sorted[:3]
+            base_score = sum(top_chunk_scores) / len(top_chunk_scores)
             
-            pl = payload_by_candidate.get(cid) or {}
+            # Section relevance
+            try:
+                section_scores = compute_section_relevance(query_text, sections, embedding_model)
+                relevant_sections = [s for s, score in section_scores.items() if score > 0.35]
+                section_boost = min(0.10, len(relevant_sections) * 0.025)
+            except Exception:
+                section_scores = {}
+                relevant_sections = []
+                section_boost = 0.0
             
-            # ==== DYNAMIC BOOST 1: Query-to-Skills Similarity (NO HARDCODING!) ====
-            candidate_skills = pl.get("skills_set") or pl.get("skills") or []
-            if isinstance(candidate_skills, dict):
-                skills_flat = []
-                for v in candidate_skills.values():
-                    if isinstance(v, (list, tuple)):
-                        skills_flat.extend([str(x) for x in v if x])
-                candidate_skills = skills_flat
-            elif not isinstance(candidate_skills, (list, tuple)):
-                candidate_skills = [str(candidate_skills)] if candidate_skills else []
+            # Skill match
+            try:
+                skill_similarity = compute_query_skill_similarity(
+                    query_text, 
+                    skills if isinstance(skills, list) else [], 
+                    embedding_model
+                )
+                skill_boost = skill_similarity * 0.12
+            except Exception:
+                skill_boost = 0.0
             
-            skill_similarity = compute_query_skill_similarity(query, candidate_skills, embedding_model)
-            skill_boost = skill_similarity * 0.15  # Scale to reasonable boost
-            
-            # ==== DYNAMIC BOOST 2: Query-to-Role Similarity (NO HARDCODING!) ====
-            role_text = " ".join([
-                str(pl.get("candidate_name") or ""),
-                str(pl.get("filename") or ""),
-                str(pl.get("sections", {}).get("summary") or "")[:300],
-            ])
-            
-            role_relevance = compute_role_relevance(query, role_text, embedding_model)
-            role_boost = role_relevance * 0.10
-            
-            # ==== DYNAMIC BOOST 3: Experience Weight ====
+            # Experience boost
             years = pl.get("total_years_experience", 0.0)
             try:
                 years_float = float(years) if years else 0.0
-                exp_boost = min(0.05, 0.02 * _np.log1p(max(0, years_float - 2)))
+                exp_boost = min(0.05, 0.015 * _np.log1p(max(0, years_float - 1)))
             except Exception:
                 exp_boost = 0.0
             
-            final_score = base_score + skill_boost + role_boost + exp_boost
+            # FINAL SCORE
+            final_score = (
+                semantic_score * 0.70 +
+                base_score * 0.15 +
+                skill_boost +
+                section_boost +
+                exp_boost
+            )
+            
+            # NOW filter by threshold
+            if final_score < threshold:
+                if debug:
+                    print(f"[filtered] {pl.get('candidate_name', 'Unknown')}: {final_score:.3f} < {threshold}")
+                continue
             
             aggregated.append({
                 "candidate_id": cid,
                 "score": float(final_score),
-                "payload": pl
+                "payload": pl,
+                "semantic_relevance": float(semantic_score),
+                "relevant_sections": relevant_sections,
+                "section_scores": section_scores
             })
         
         return sorted(aggregated, key=lambda x: x["score"], reverse=True)
-
-    ranked_candidates = aggregate_by_candidate(hits, top_n=3)[:max(top_k, 500)]
-
-    # 5) apply post-filters at candidate level (skill, location, min_years)
+    
+    ranked_candidates = aggregate_candidates(hits, query, relevance_threshold)
+    
+    if debug:
+        print(f"[semantic_search] After aggregation: {len(ranked_candidates)} candidates")
+        for i, c in enumerate(ranked_candidates[:5], 1):
+            print(f"  {i}. {c['payload'].get('candidate_name', 'Unknown')}: "
+                  f"score={c['score']:.3f}, semantic={c['semantic_relevance']:.3f}")
+    
+    # 5) Apply post-filters
     def _candidate_matches_filters(candidate_entry):
         pl = candidate_entry.get("payload") or {}
-
-        # skill match: prefer skills_set, fallback to skills or full_text
+        
         if filter_skill:
             fs = str(filter_skill).strip().lower()
-            matched_skill = False
             skills_set = pl.get("skills_set") or pl.get("skills") or []
             if isinstance(skills_set, dict):
-                # sometimes skills stored as dict buckets
                 skills_flat = []
                 for v in skills_set.values():
                     if isinstance(v, (list, tuple)):
                         skills_flat.extend([str(x).lower() for x in v if x])
-                skills_flat = list(dict.fromkeys(skills_flat))
             elif isinstance(skills_set, (list, tuple)):
                 skills_flat = [str(x).lower() for x in skills_set if x]
             else:
-                skills_flat = [str(skills_set).lower()]
-            if any(fs == s or fs in s or s in fs for s in skills_flat):
-                matched_skill = True
-            # fallback: check full_text blob
-            if not matched_skill:
-                full = str(pl.get("full_text") or "")
-                if fs in full.lower():
-                    matched_skill = True
-            if not matched_skill:
+                skills_flat = []
+            
+            if not any(fs in s or s in fs for s in skills_flat):
                 return False
-
-        # location match (substring compare)
+        
         if filter_location:
             fl = str(filter_location).strip().lower()
             locs = pl.get("locations") or []
@@ -1510,56 +1665,83 @@ def semantic_search(query: str,
                 locs = [locs]
             locs_low = [str(x).lower() for x in locs if x]
             if not any(fl in l for l in locs_low):
-                # also check filename or candidate_name fallback
-                name_and_file = " ".join([str(pl.get("candidate_name") or ""), str(pl.get("filename") or "")]).lower()
-                if fl not in name_and_file:
-                    return False
-
-        # min years check
+                return False
+        
         if min_years_experience is not None:
             try:
                 required = float(min_years_experience)
-                # prefer explicit total_years_experience
-                tys = pl.get("total_years_experience")
-                if tys is None:
-                    # fallback: try to estimate from experience entries if available (simple heuristic)
-                    tys = 0.0
-                    exp_entries = pl.get("experience") or []
-                    if isinstance(exp_entries, (list, tuple)):
-                        # if items contain "X years" string, pick max/sum heuristically
-                        for e in exp_entries:
-                            try:
-                                import re as _re
-                                if isinstance(e, dict):
-                                    txt = " ".join([str(e.get(k,"")) for k in ("dates","raw","summary") if e.get(k)])
-                                else:
-                                    txt = str(e)
-                                m = _re.search(r'(\d+(?:\.\d+)?)\s+years?', txt, flags=_re.I)
-                                if m:
-                                    tys += float(m.group(1))
-                            except Exception:
-                                continue
-                try:
-                    tys_f = float(tys or 0.0)
-                except Exception:
-                    tys_f = 0.0
-                if tys_f < float(required):
+                tys = pl.get("total_years_experience", 0.0)
+                tys_f = float(tys or 0.0)
+                if tys_f < required:
                     return False
             except Exception:
-                # if parsing min_years failed, ignore filter
                 pass
-
+        
         return True
-
+    
     filtered_candidates = [c for c in ranked_candidates if _candidate_matches_filters(c)]
-
-    # 6) Convert to output format similar to older returns: list of {"score", "payload"}
-    out = []
-    for c in filtered_candidates[:top_k]:
-        out.append({"score": float(c.get("score") or 0.0), "payload": c.get("payload") or {}, "candidate_id": c.get("candidate_id")})
+    
+    if debug:
+        print(f"[semantic_search] After filters: {len(filtered_candidates)} candidates")
+    
+    # 6) Return top_k
+    out = filtered_candidates[:top_k]
     return out
 
+# ============================================================================
+# Helper function for CLI to explain matches
+# ============================================================================
+
+def explain_match(candidate_result: Dict[str, Any], query: str) -> List[str]:
+    """
+    Generate natural language explanation for why a candidate matched.
+    Uses the semantic relevance scores computed during search.
+    """
+    explanations = []
+    
+    semantic_score = candidate_result.get("semantic_relevance", 0.0)
+    relevant_sections = candidate_result.get("relevant_sections", [])
+    section_scores = candidate_result.get("section_scores", {})
+    
+    # Overall match quality
+    if semantic_score > 0.45:
+        explanations.append("• Strong semantic match with your requirements")
+    elif semantic_score > 0.35:
+        explanations.append("• Good alignment with your search criteria")
+    else:
+        explanations.append("• Moderate match with query intent")
+    
+    # Section-specific matches
+    if relevant_sections:
+        top_section = max(section_scores.items(), key=lambda x: x[1])[0]
+        top_score = section_scores[top_section]
+        if top_score > 0.40:
+            section_name = top_section.replace("_", " ").title()
+            explanations.append(f"• {section_name} section highly relevant ({top_score:.2f} similarity)")
+    
+    # Skills match
+    payload = candidate_result.get("payload", {})
+    skills = payload.get("skills_set") or payload.get("skills") or []
+    if isinstance(skills, list) and len(skills) > 0:
+        # Check for query terms in skills
+        query_lower = query.lower()
+        query_terms = set(query_lower.split())
+        skill_matches = [s for s in skills if any(term in str(s).lower() for term in query_terms)]
+        if skill_matches:
+            explanations.append(f"• Relevant skills: {', '.join(str(s) for s in skill_matches[:4])}")
+    
+    # Experience
+    years = payload.get("total_years_experience", 0)
+    if years and years > 2:
+        explanations.append(f"• {years:.1f} years of relevant experience")
+    
+    return explanations[:4] 
+
+
 def parse_resume_file(path: str) -> dict:
+    """
+    Parse resume with FIXED experience calculation.
+    """
     parsed = {
         "candidate_name": None,
         "candidate_id": os.path.basename(path),
@@ -1570,7 +1752,8 @@ def parse_resume_file(path: str) -> dict:
         "sections": {},
         "skills": [],
         "skills_by_category": {"technical": {}, "soft": [], "other": []},
-        "experience": []
+        "experience": [],
+        "total_years_experience": 0.0
     }
 
     try:
@@ -1583,47 +1766,47 @@ def parse_resume_file(path: str) -> dict:
             m2 = re.search(r'(\+?\d[\d\-\.\s\(\)]{7,}\d)', full_text)
             parsed["phone"] = m2.group(0).strip() if m2 else None
 
-        # candidate name
+        # Extract candidate name BEFORE parsing sections
         try:
             parsed_name = extract_candidate_name_from_text(parsed.get("full_text", ""), filename=path)
-            if parsed_name:
+            if parsed_name and parsed_name != "Unknown":
                 parsed["candidate_name"] = parsed_name
         except Exception:
-            # keep going if name extraction fails
             pass
 
-        # split into sections
+        # Split into sections
         parsed_sections = {}
         if full_text:
             try:
                 sections = split_into_sections(full_text)
                 for hdr, body in sections:
                     key = canonicalize_heading(hdr) or "body"
-                    # append bodies under same key
                     parsed_sections[key] = parsed_sections.get(key, "") + ("\n" + body if parsed_sections.get(key) else body)
             except Exception:
                 parsed_sections["body"] = full_text
         parsed["sections"] = parsed_sections
 
-        # skills extraction
+        # Extract skills (from skills section, with better filtering)
         try:
             skills_section_text = (parsed_sections.get("skills") or "").strip()
             if skills_section_text:
                 extracted_skills = extract_skills_from_section_combined(skills_section_text, full_text=full_text)
             else:
-                extracted_skills = extract_skills_from_section_combined(full_text, full_text=full_text)
+                # Don't default to full_text for skill extraction - be conservative
+                extracted_skills = extract_skills_from_section_combined("", full_text=full_text)
 
             cleaned = []
             seen = set()
             for s in (extracted_skills or []):
                 st = str(s).strip()
                 st = re.sub(r'^[\W_]+|[\W_]+$', '', st)
-                if not st:
+                if not st or len(st) < 2:
                     continue
                 key = st.lower()
                 if key not in seen:
                     seen.add(key)
                     cleaned.append(st)
+            
             parsed["skills"] = cleaned
             parsed["skills_by_category"] = categorize_skills_for_resume(parsed["skills"], full_text=full_text)
         except Exception as e:
@@ -1631,45 +1814,35 @@ def parse_resume_file(path: str) -> dict:
             parsed["skills"] = []
             parsed["skills_by_category"] = {"technical": {}, "soft": [], "other": []}
 
-        # experience extraction + total years computation
+        # Extract experience and calculate total years
         try:
-            exp_text = ""
-            if parsed["sections"].get("experience"):
-                exp_text = parsed["sections"].get("experience", "").strip()
-            else:
-                for k, v in parsed["sections"].items():
-                    if v and ("experience" in (k or "").lower() or "employment" in (k or "").lower() or "work" in (k or "").lower()):
-                        exp_text = v.strip()
-                        break
-
+            exp_text = parsed["sections"].get("experience", "").strip()
             if exp_text:
                 parsed["experience"] = extract_experience_from_section(exp_text)
             else:
                 parsed["experience"] = []
 
-            # compute total_years_experience from structured experience entries
-            try:
-                intervals = []
-                for e in parsed.get("experience", []):
+            # Calculate total years from structured experience entries
+            intervals = []
+            for e in parsed.get("experience", []):
+                if isinstance(e, dict):
                     sd_token = e.get("start_date")
                     ed_token = e.get("end_date")
 
                     s_date = None
                     e_date = None
 
-                    # parse start date (already ISO string from extract_experience_from_section or None)
+                    # Parse start date
                     if sd_token:
                         try:
-                            # allow both ISO date strings and date objects
                             if isinstance(sd_token, str):
                                 s_date = datetime.date.fromisoformat(sd_token)
                             elif isinstance(sd_token, datetime.date):
                                 s_date = sd_token
                         except Exception:
-                            # ignore entries we can't parse
-                            s_date = None
+                            pass
 
-                    # parse end date (handle "Present" tokens if present)
+                    # Parse end date
                     if ed_token:
                         try:
                             if isinstance(ed_token, str):
@@ -1680,25 +1853,23 @@ def parse_resume_file(path: str) -> dict:
                             elif isinstance(ed_token, datetime.date):
                                 e_date = ed_token
                         except Exception:
-                            e_date = datetime.date.today()
-                    # if no end date but start exists, assume present
+                            pass
+
+                    # If start exists but no end, assume current
                     if s_date and not e_date:
                         e_date = datetime.date.today()
 
+                    # Add valid interval
                     if s_date and e_date and e_date >= s_date:
                         intervals.append((s_date, e_date))
 
-                parsed['total_years_experience'] = _merge_intervals_and_total_years(intervals)
-            except Exception as e:
-                log.debug("total years aggregation failed for %s: %s", path, e)
-                parsed['total_years_experience'] = 0.0
-
+            parsed['total_years_experience'] = _merge_intervals_and_total_years(intervals)
         except Exception as e:
             log.debug("experience extraction failed: %s", e)
             parsed["experience"] = []
             parsed['total_years_experience'] = 0.0
 
-        # locations
+        # Extract locations
         try:
             parsed["locations"] = extract_locations_from_text(full_text)
         except Exception:

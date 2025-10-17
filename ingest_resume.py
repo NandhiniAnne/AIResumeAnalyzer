@@ -249,44 +249,27 @@ def _smart_chunk(full_text: str):
     return final_chunks
 def _gather_points(resume_folder: str) -> _List[dict]:
     """
-    Parse resumes, compute chunk embeddings, and attach a role-focused
-    _candidate_vector to each chunk payload for candidate-level reranking.
-
-    Improvements:
-     - build a canonical `skills_set` for each candidate using post_process_skills()
-       (or a conservative fallback) so Qdrant payloads contain normalized tokens.
-     - ensure deterministic candidate_id (email or filename).
-     - limit chunks per file to `per_file_chunk_cap`.
+    Parse resumes with FIXED skills extraction and experience calculation.
     """
-    # Attempt to import post-processing utilities from chatbot_poc; tolerate failure
-    try:
-        from chatbot_poc import post_process_skills, map_token_to_canonical
-    except Exception:
-        post_process_skills = None
-        map_token_to_canonical = None
-
     files = [f for f in _os.listdir(resume_folder) if f.lower().endswith(('.pdf', '.docx', '.txt'))]
     print(f"Found {len(files)} files in '{resume_folder}'")
     if not files:
-        raise FileNotFoundError(f"No resume files found in '{resume_folder}'. Put .pdf/.docx/.txt files there.")
+        raise FileNotFoundError(f"No resume files found in '{resume_folder}'.")
 
     if _embedding_model is None:
-        raise RuntimeError("Embedding model not initialized. Call init_skill_model(...) before gathering points.")
+        raise RuntimeError("Embedding model not initialized.")
 
     dim = _embedding_model.get_sentence_embedding_dimension()
     points = []
-
-    # chunking params (tune if needed)
-    min_words = 40
-    max_words = 400
-    window = 300
-    stride = 200
     per_file_chunk_cap = 120
 
-    # helper to do conservative normalization when post_process_skills is not available
-    def _fallback_normalize_skills(raw_skills, full_text):
+    # Simple skill cleaning - NO aggressive filtering
+    def _simple_clean_skills(raw_skills):
+        """Conservative cleaning - keep most tokens."""
         out = []
         seen = set()
+        
+        # Flatten if dict
         if isinstance(raw_skills, dict):
             vals = []
             for v in raw_skills.values():
@@ -296,70 +279,61 @@ def _gather_points(resume_folder: str) -> _List[dict]:
                     vals.append(str(v))
             raw_list = vals
         elif isinstance(raw_skills, (list, tuple)):
-            raw_list = list(raw_skills)
-        elif raw_skills:
-            raw_list = [str(raw_skills)]
+            raw_list = [str(s) for s in raw_skills if s]
         else:
-            raw_list = []
+            raw_list = [str(raw_skills)] if raw_skills else []
 
         for s in raw_list:
-            if not s: continue
-            t = str(s).strip()
-            # remove leading/trailing quotes/parenthesis artifacts
-            t = _re.sub(r'^[\s"\'`]+|[\s"\'`]+$', '', t)
-            t = _re.sub(r'[\(\)]+$', '', t).strip()  # drop trailing parentheses leftovers
-            # drop obviously long descriptive phrases
-            if len(t.split()) > 6:
-                # try to extract embedded tech tokens
-                kws = _re.findall(r'\b(python|scala|java|spark|hadoop|kafka|hive|airflow|sql|snowflake|dynamodb|databricks|azure|aws|gcp|bigquery|dbt)\b', t, flags=re.I)
-                if not kws:
-                    continue
-                else:
-                    for k in kws:
-                        k = k.lower()
-                        if k not in seen:
-                            seen.add(k); out.append(k)
-                    continue
-
-            t = t.lower()
-            # filter trivial tokens
-            if t in ("and","or","with","experience","skills","skill","years","year","the","a","an","in","of","for","is","are"):
+            if not s:
                 continue
+            t = str(s).strip().lower()
+            
+            # Remove quotes/parentheses
+            t = _re.sub(r'^[\s"\'`\(\)]+|[\s"\'`\(\)]+$', '', t)
+            
+            # Skip empty or trivial
+            if not t or len(t) < 2:
+                continue
+            
+            # Skip obvious stopwords
+            if t in ("and", "or", "with", "the", "a", "an", "in", "of", "for"):
+                continue
+            
+            # Skip if too long (likely a sentence)
+            if len(t.split()) > 8:
+                continue
+            
             if t not in seen:
-                seen.add(t); out.append(t)
-        return out
+                seen.add(t)
+                out.append(t)
+        
+        return out[:200]  # Cap at 200 skills
 
     for fn in files:
         path = _os.path.join(resume_folder, fn)
-        print("Parsing:", fn)
+        print(f"Parsing: {fn}")
+        
         try:
             parsed = _parse_resume_file(path)
         except Exception as e:
             print(f"Error parsing {fn}: {e}")
-            parsed = {
-                "candidate_name": _os.path.splitext(fn)[0], "candidate_id": None, "email": None,
-                "skills": {}, "locations": [], "sections": {}, "experience": [], "full_text": ""
-            }
+            continue
 
         full_text = parsed.get("full_text") or ""
         if not full_text:
-            print(f"[{fn}] empty full_text after parsing; using fallback reader.")
+            print(f"[{fn}] empty full_text, trying fallback reader")
             try:
                 full_text = _fallback_read_text(path)
+                parsed["full_text"] = full_text
             except Exception as fe:
                 print(f"Fallback read failed for {fn}: {fe}")
-                full_text = ""
-            parsed["full_text"] = full_text
+                continue
 
-        # deterministic candidate_id: prefer explicit id -> email -> filename (lowercased)
+        # Candidate ID
         cand_id = parsed.get("candidate_id") or parsed.get("email") or _os.path.basename(fn)
-        if cand_id:
-            cand_id = str(cand_id).strip()
-        else:
-            cand_id = _os.path.basename(fn)
-        candidate_id_norm = cand_id.lower()
+        candidate_id_norm = str(cand_id).strip().lower()
 
-        # Compute candidate-level role text and candidate vector (once per file)
+        # Candidate vector (role-focused)
         role_text = _role_focused_text(parsed, full_text)
         try:
             cand_vec = _embedding_model.encode(role_text)
@@ -367,98 +341,107 @@ def _gather_points(resume_folder: str) -> _List[dict]:
                 cand_vec = cand_vec.tolist()
             cand_vec = _normalize_vec(cand_vec)
         except Exception as e:
-            print(f"[{fn}] candidate vector build failed:", e)
+            print(f"[{fn}] candidate vector failed: {e}")
             cand_vec = None
 
-        # Precompute total_years and normalized skills_set once per file (faster)
-        total_years_for_file = _estimate_total_years_from_experience(parsed.get("experience") or [])
+        # === FIX 1: Better experience calculation ===
+        experience_list = parsed.get("experience") or []
+        total_years = 0.0
+        
+        if experience_list and isinstance(experience_list, list):
+            # Use the built-in duration_years from parsed experience
+            for exp in experience_list:
+                if isinstance(exp, dict):
+                    dur = exp.get("duration_years")
+                    if dur and isinstance(dur, (int, float)):
+                        total_years += float(dur)
+        
+        # Fallback: try estimation if still 0
+        if total_years == 0.0 and experience_list:
+            total_years = _estimate_total_years_from_experience(experience_list)
+        
+        # Clamp to reasonable range
+        total_years = min(60.0, max(0.0, round(total_years, 1)))
+        
+        # Store back in parsed for consistency
+        parsed["total_years_experience"] = float(total_years)
+        
+        print(f"  → Experience: {total_years:.1f} years")
 
-        # raw skills from parser
+        # === FIX 2: Better skills extraction ===
         raw_skills = parsed.get("skills") or []
+        
+        # Use simple cleaning instead of aggressive post_process_skills
+        skills_set = _simple_clean_skills(raw_skills)
+        
+        # If skills_set is empty, try to extract from skills section directly
+        if not skills_set:
+            sections = parsed.get("sections") or {}
+            skills_text = sections.get("skills") or ""
+            if skills_text:
+                # Quick extraction: split by common delimiters
+                tokens = _re.split(r'[,;\n|]+', skills_text)
+                temp = []
+                for tok in tokens:
+                    tok = tok.strip().lower()
+                    if tok and 2 <= len(tok) <= 50 and len(tok.split()) <= 5:
+                        temp.append(tok)
+                skills_set = list(dict.fromkeys(temp))[:200]
+        
+        print(f"  → Skills: {len(skills_set)} found")
+        if skills_set:
+            print(f"    Sample: {', '.join(skills_set[:5])}")
 
-        # Build canonical skills_set:
-        skills_set = []
-        try:
-            if post_process_skills is not None:
-                processed = post_process_skills(raw_skills, full_text=full_text, whitelist=None, fuzzy_cutoff=0.78)
-                # post_process_skills returns canonical or normalized tokens; ensure dedupe & lower
-                seen = set()
-                for s in processed:
-                    if not s: continue
-                    s2 = _re.sub(r'^[\W_]+|[\W_]+$', '', str(s)).strip().lower()
-                    if not s2: continue
-                    # drop overly long phrase artifacts
-                    if len(s2.split()) > 6:
-                        # try map_token_to_canonical for embedded tech token if available
-                        if map_token_to_canonical is not None:
-                            m = map_token_to_canonical(s2, fuzzy_cutoff=85.0)
-                            if m:
-                                s2 = m
-                            else:
-                                continue
-                        else:
-                            continue
-                    if s2 not in seen:
-                        seen.add(s2); skills_set.append(s2)
-            else:
-                skills_set = _fallback_normalize_skills(raw_skills, full_text)
-        except Exception as e:
-            print(f"[{fn}] skill post-processing failed: {e}")
-            skills_set = _fallback_normalize_skills(raw_skills, full_text)
-
-        # Ensure fallback non-empty skills_set if nothing found (very conservative)
-        if not skills_set and raw_skills:
-            skills_set = _fallback_normalize_skills(raw_skills, full_text)
-
-        # limit and dedupe
-        skills_set = list(dict.fromkeys(skills_set))[:200]
-
-        # chunking (and cap number of chunks per file)
+        # Chunking
         chunks = _smart_chunk(full_text)
         if not chunks:
-            fallback = full_text[:400]
-            if fallback:
-                chunks = [fallback]
-            else:
-                print(f"[{fn}] no usable text found; skipping file.")
-                continue
+            print(f"[{fn}] no usable chunks, skipping")
+            continue
 
-        if per_file_chunk_cap and len(chunks) > per_file_chunk_cap:
-            # heuristics: keep evenly spaced chunks (avoid biasing to head)
-            step = max(1, int(len(chunks) / per_file_chunk_cap))
+        if len(chunks) > per_file_chunk_cap:
+            step = max(1, len(chunks) // per_file_chunk_cap)
             chunks = [chunks[i] for i in range(0, len(chunks), step)][:per_file_chunk_cap]
 
-        # embed each chunk
-        for chunk in chunks:
+        print(f"  → Creating {len(chunks)} chunks")
+
+        # Embed chunks
+        for chunk_idx, chunk in enumerate(chunks):
             try:
                 vec = _embedding_model.encode(chunk)
                 if hasattr(vec, "tolist"):
                     vec = vec.tolist()
                 if not isinstance(vec, list) or len(vec) != dim:
-                    raise ValueError(f"Bad embedding dim {0 if not vec else len(vec)} (expected {dim})")
+                    raise ValueError(f"Bad dim {len(vec)} != {dim}")
                 vec = _normalize_vec(vec)
             except Exception as e:
-                print(f"[{fn}] embedding error for a chunk; skipping. Err:", e)
+                print(f"[{fn}] chunk {chunk_idx} embedding failed: {e}")
                 continue
 
-            # Build payload: keep human-readable 'skills' and canonical 'skills_set'
+            # Build payload with FIXED data
             payload = {
-               "filename": fn,
-               "candidate_name": parsed.get("candidate_name") or _os.path.splitext(fn)[0],
-               "candidate_id": candidate_id_norm,
-               "email": parsed.get("email"),
-               "skills": parsed.get("skills"),                # human-readable list (unchanged)
-               "skills_set": skills_set,                      # canonical normalized tokens (lower-case)
-               "locations": parsed.get("locations"),
-               "total_years_experience": parsed.get("total_years_experience", total_years_for_file or 0.0),
-               "sections": parsed.get("sections"),
-               "experience": parsed.get("experience"),
-               "full_text": parsed.get("full_text"),
-               "text": chunk[:3000],
-               "_candidate_vector": cand_vec,
-           }
+                "filename": fn,
+                "candidate_name": parsed.get("candidate_name") or _os.path.splitext(fn)[0],
+                "candidate_id": candidate_id_norm,
+                "email": parsed.get("email"),
+                "skills": raw_skills,  # Keep original for reference
+                "skills_set": skills_set,  # Use cleaned version
+                "skills_by_category": parsed.get("skills_by_category"),
+                "locations": parsed.get("locations") or [],
+                "total_years_experience": float(total_years),  # FIXED
+                "sections": parsed.get("sections") or {},
+                "experience": experience_list,
+                "full_text": full_text[:10000],  # Cap to avoid huge payloads
+                "text": chunk[:3000],
+                "_candidate_vector": cand_vec,
+            }
 
-            points.append({"id": str(_uuid.uuid4()), "vector": vec, "payload": payload})
+            points.append({
+                "id": str(_uuid.uuid4()),
+                "vector": vec,
+                "payload": payload
+            })
+
+        print(f"  ✓ Added {len([p for p in points if p['payload']['filename'] == fn])} points\n")
 
     return points
 
